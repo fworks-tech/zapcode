@@ -1,0 +1,28 @@
+{
+  "name": "zapcode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-user bridge between unofficial WhatsApp and OpenCode",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "opencode": "dotenv run --quiet -- opencode serve --hostname 127.0.0.1 --port 4096",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/client": "2.4.1",
+    "dotenv": "18.0.10",
+    "express": "4.22.3"
+  },
+  "devDependencies": {
+    "@types/express": "4.17.25",
+    "@types/node": "26.6.7",
+    "@types/supertest": "7.2.1",
+    "supertest": "7.3.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}
