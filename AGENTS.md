@@ -9,7 +9,7 @@ zapcode is a single-user, local bridge between unofficial WhatsApp and one OpenC
 - Core verification: `npm test && npm run typecheck`.
 - Strict unused check: `npx tsc --noEmit --noUnusedLocals --noUnusedParameters`.
 - Focused test: `npx tsx --test tests/webhook.test.ts`; `npm test` auto-discovers `tests/*.test.ts`.
-- No lint, formatter, build, CI, repo hooks, or `npm start` script exists. Run the TypeScript bridge with `npm run dev`.
+- No lint, formatter, build, repo hooks, or `npm start` script exists. CI runs `npm ci`, `npm test`, and `npm run typecheck` on pull requests and pushes to `master`. Run the TypeScript bridge with `npm run dev`.
 - Runtime order, each in its own terminal: `docker compose up -d` → `npm run opencode` → `npm run dev` → `cloudflared tunnel --url http://127.0.0.1:3000`. Then follow README steps 6–7 to create the Evolution instance, configure `/webhook`, and link WhatsApp.
 - `npm run opencode` must run from the repository root. It loads `.env` and serves OpenCode V2 on `127.0.0.1:4096`; changing that port requires changing both `OPENCODE_URL` and the npm script. If `PORT` changes, update health checks and the tunnel URL too.
 
