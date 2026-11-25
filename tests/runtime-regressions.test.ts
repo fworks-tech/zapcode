@@ -11,76 +11,7 @@ import test from 'node:test'
 
 import { createMessageHandler } from '../src/handler.js'
 import { cancelExecution, CancellationNotConfirmedError } from '../src/opencode.js'
-import { createMessageRuntime } from '../src/runtime.js'
-
-/** Phone number allowed by the runtime tests. */
-const webhookConfig = { allowedNumber: '5511999999999' }
-
-/** Complete runtime configuration used by recovery tests. */
-const runtimeConfig = {
-  openCodeUrl: 'http://127.0.0.1:4096',
-  openCodePassword: 'opencode-password-with-32-characters',
-  workdir: 'C:/Github/zapcode',
-  knowledgeDir: 'C:/Github/zapcode/knowledge',
-  sessionFile: 'C:/Github/zapcode/data/session.json',
-  evolutionUrl: 'http://evolution',
-  evolutionApiKey: 'api-key',
-  evolutionInstance: 'zapcode',
-  allowedNumber: webhookConfig.allowedNumber,
-  webhookSecret: 'webhook-secret-with-32-characters',
-  port: 3000,
-}
-
-/** Runtime test doubles that may be overridden per scenario. */
-interface RuntimeHarnessOverrides {
-  client?: Record<string, unknown>
-  sessions?: Record<string, unknown>
-  permissions?: Record<string, unknown>
-}
-
-/**
- * Builds a runtime with shared defaults and captures WhatsApp output.
- *
- * @param overrides - Boundary behavior that differs from the defaults.
- * @returns Runtime, sent messages, and a fetch restoration function.
- */
-function createRuntimeHarness(overrides: RuntimeHarnessOverrides = {}) {
-  /** WhatsApp messages captured from the mocked Evolution request. */
-  const sent: string[] = []
-  /** Original fetch restored by each test. */
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async (_input, init) => {
-    if (init?.body) {
-      const body = JSON.parse(String(init.body))
-      sent.push(body.textMessage.text)
-    }
-    return Response.json({})
-  }
-
-  const sessions = {
-    ensure: async () => 'session-1',
-    reset: async () => undefined,
-    currentSessionID: async () => 'session-1',
-    getActiveRun: async () => undefined,
-    markActive: async () => undefined,
-    clearActive: async () => undefined,
-    ...overrides.sessions,
-  }
-  const permissions = {
-    clear: async () => undefined,
-    decide: async () => null,
-    setActiveSession: () => undefined,
-    reconcile: async () => undefined,
-    ...overrides.permissions,
-  }
-  const runtime = createMessageRuntime({
-    config: runtimeConfig,
-    client: (overrides.client ?? { session: {} }) as never,
-    sessions: sessions as never,
-    permissions: permissions as never,
-  })
-  return { runtime, sent, restore: () => { globalThis.fetch = originalFetch } }
-}
+import { createRuntimeHarness, deferred, webhookConfig } from './helpers/runtime.js'
 
 /** Verifies that reset recovers and cancels a run persisted before restart. */
 test('reset cancels an active run recovered from disk', async () => {
@@ -117,14 +48,10 @@ test('reset cancels an active run recovered from disk', async () => {
 
 /** Verifies that reset during active-run recovery prevents later prompt admission. */
 test('reset during active-run recovery prevents session creation and admission', async () => {
-  /** Resolver for the first active-run read. */
-  let release!: () => void
   /** Promise controlling the prompt's recovery read. */
-  const blocked = new Promise<void>((resolve) => { release = resolve })
-  /** Resolver fired when the prompt starts its recovery read. */
-  let markStarted!: () => void
+  const blocked = deferred<void>()
   /** Promise that removes scheduling assumptions. */
-  const started = new Promise<void>((resolve) => { markStarted = resolve })
+  const started = deferred<void>()
   /** Counts recovery reads. */
   let recoveryReads = 0
   /** Counts session ensure calls. */
@@ -136,8 +63,8 @@ test('reset during active-run recovery prevents session creation and admission',
       getActiveRun: async () => {
         recoveryReads++
         if (recoveryReads === 1) {
-          markStarted()
-          await blocked
+          started.resolve()
+          await blocked.promise
         }
         return undefined
       },
@@ -145,9 +72,9 @@ test('reset during active-run recovery prevents session creation and admission',
   })
   try {
     const pending = harness.runtime.handler(webhookConfig.allowedNumber, 'old task')
-    await started
+    await started.promise
     const resetting = harness.runtime.handler(webhookConfig.allowedNumber, '/reset')
-    release()
+    blocked.resolve()
     await Promise.all([pending, resetting])
     assert.equal(ensureCalls, 0)
     assert.deepEqual(harness.sent, ['Saved session cleared. Your next message starts with a clean context.'])
@@ -197,14 +124,10 @@ test('a recovered active run blocks new prompts until reset succeeds', async (te
 /** Verifies that shutdown blocks queued turns from entering OpenCode. */
 test('shutdown prevents queued turns from starting after cancellation', async (testContext) => {
   testContext.mock.method(console, 'error', () => undefined)
-  /** Resolver for session creation. */
-  let release!: () => void
   /** Promise controlling the first prompt's session setup. */
-  const blocked = new Promise<void>((resolve) => { release = resolve })
-  /** Resolver fired when session setup starts. */
-  let markStarted!: () => void
+  const blocked = deferred<void>()
   /** Promise that removes scheduling assumptions. */
-  const started = new Promise<void>((resolve) => { markStarted = resolve })
+  const started = deferred<void>()
   /** Counts session ensure calls. */
   let ensureCalls = 0
   const harness = createRuntimeHarness({
@@ -217,18 +140,18 @@ test('shutdown prevents queued turns from starting after cancellation', async (t
     sessions: {
       ensure: async () => {
         ensureCalls++
-        markStarted()
-        await blocked
+        started.resolve()
+        await blocked.promise
         return 'session-1'
       },
     },
   })
   try {
     const first = harness.runtime.handler(webhookConfig.allowedNumber, 'first')
-    await started
+    await started.promise
     const second = harness.runtime.handler(webhookConfig.allowedNumber, 'second')
     const shuttingDown = harness.runtime.shutdown()
-    release()
+    blocked.resolve()
     await Promise.allSettled([first, second, shuttingDown])
     assert.equal(ensureCalls, 1)
   } finally {
@@ -238,10 +161,8 @@ test('shutdown prevents queued turns from starting after cancellation', async (t
 
 /** Verifies that permission decisions cannot overtake an active reset. */
 test('permission decisions are serialized with reset', async () => {
-  /** Resolver for the blocked permission decision. */
-  let release!: () => void
   /** Promise controlling the decision. */
-  const blocked = new Promise<void>((resolve) => { release = resolve })
+  const blocked = deferred<void>()
   /** Records operation order. */
   const order: string[] = []
   const handler = createMessageHandler({
@@ -250,7 +171,7 @@ test('permission decisions are serialized with reset', async () => {
     reset: async () => { order.push('reset') },
     decidePermission: async () => {
       order.push('decision-start')
-      await blocked
+      await blocked.promise
       order.push('decision-end')
       return 'granted'
     },
@@ -262,7 +183,7 @@ test('permission decisions are serialized with reset', async () => {
   const resetting = handler(webhookConfig.allowedNumber, '/reset')
   await new Promise<void>((resolve) => setImmediate(resolve))
   assert.deepEqual(order, ['decision-start'])
-  release()
+  blocked.resolve()
   await Promise.all([decision, resetting])
   assert.deepEqual(order, ['decision-start', 'decision-end', 'cancel', 'reset'])
 })

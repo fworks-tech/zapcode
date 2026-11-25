@@ -11,7 +11,7 @@
     "dev": "tsx watch src/index.ts",
     "opencode": "dotenv run --quiet -- opencode serve --hostname 127.0.0.1 --port 4096",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/core.test.ts tests/app.test.ts tests/runtime.test.ts tests/permissions-regressions.test.ts tests/session-response-regressions.test.ts tests/handler-webhook-regressions.test.ts tests/runtime-regressions.test.ts tests/reliability-regressions.test.ts tests/opencode-contract.test.ts"
+    "test": "tsx --test \"tests/*.test.ts\""
   },
   "dependencies": {
     "@opencode/client": "2.4.1",

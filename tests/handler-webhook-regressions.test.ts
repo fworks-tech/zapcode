@@ -12,30 +12,13 @@ import request from 'supertest'
 
 import { createApp } from '../src/app.js'
 import { createMessageHandler, QueueBusyError } from '../src/handler.js'
-
-/** Webhook settings shared by the HTTP tests. */
-const webhookConfig = {
-  webhookSecret: 'secret',
-  allowedNumber: '5511999999999',
-}
-
-/** Builds a valid direct-message payload with a customizable ID and JID. */
-function payload(id = 'message-1', remoteJid = '5511999999999@s.whatsapp.net') {
-  return {
-    event: 'messages.upsert',
-    data: {
-      key: { id, remoteJid, fromMe: false },
-      message: { conversation: 'Hello' } as Record<string, unknown>,
-    },
-  }
-}
+import { deferred } from './helpers/runtime.js'
+import { payload, webhookConfig } from './helpers/webhook.js'
 
 /** Verifies that reset stops response chunks that have not started sending. */
 test('/reset stops old response chunks before the next send', async () => {
-  /** Resolver for the first blocked WhatsApp send. */
-  let release!: () => void
   /** Promise controlling the first chunk send. */
-  const blocked = new Promise<void>((resolve) => { release = resolve })
+  const blocked = deferred<void>()
   /** Captures delivered chunks in order. */
   const sent: string[] = []
   /** Counts send calls. */
@@ -48,7 +31,7 @@ test('/reset stops old response chunks before the next send', async () => {
     decidePermission: async () => null,
     send: async (_to, text) => {
       sends++
-      if (sends === 1) await blocked
+      if (sends === 1) await blocked.promise
       sent.push(text)
     },
     allowedNumber: webhookConfig.allowedNumber,
@@ -57,7 +40,7 @@ test('/reset stops old response chunks before the next send', async () => {
   await new Promise<void>((resolve) => setImmediate(resolve))
   const resetting = handler(webhookConfig.allowedNumber, '/reset')
   await new Promise<void>((resolve) => setImmediate(resolve))
-  release()
+  blocked.resolve()
   await Promise.all([pending, resetting])
   assert.equal(sent.length, 2)
   assert.equal(sent[0]?.length, 3_500)
@@ -118,6 +101,25 @@ test('webhook can retry a message after a busy response', async (testContext) =>
   assert.equal(calls, 2)
 })
 
+/** Verifies that supported text payloads require a non-empty string ID. */
+test('webhook rejects supported text with a missing or invalid message ID', async () => {
+  /** Counts handler calls. */
+  let calls = 0
+  const app = createApp(webhookConfig, async () => { calls++ })
+  for (const id of [undefined, '', '   ', 42]) {
+    /** Payload mutated to exercise one invalid ID shape. */
+    const body = payload()
+    if (id === undefined) delete (body.data.key as { id?: string }).id
+    else (body.data.key as { id?: unknown }).id = id
+    await request(app)
+      .post('/webhook')
+      .set('Webhook-Secret', 'secret')
+      .send(body)
+      .expect(400, { error: 'missing message id' })
+  }
+  assert.equal(calls, 0)
+})
+
 /** Verifies strict direct JID validation and unauthorized-media handling. */
 test('webhook rejects malformed JIDs and blocks unauthorized direct media', async () => {
   /** Counts handler calls. */
@@ -131,15 +133,53 @@ test('webhook rejects malformed JIDs and blocks unauthorized direct media', asyn
   assert.equal(calls, 0)
 })
 
+/** Verifies that a failed confirmation does not report a successful permission as failed. */
+test('permission confirmation failure does not change a successful decision', async (testContext) => {
+  testContext.mock.method(console, 'error', () => undefined)
+  /** Records whether the server decision ran. */
+  let decided = false
+  /** Counts confirmation attempts. */
+  let sends = 0
+  const handler = createMessageHandler({
+    prompt: async () => 'response',
+    cancel: async () => undefined,
+    reset: async () => undefined,
+    decidePermission: async () => { decided = true; return 'granted' },
+    send: async () => { sends++; throw new Error('WhatsApp unavailable') },
+    allowedNumber: webhookConfig.allowedNumber,
+  })
+  await handler(webhookConfig.allowedNumber, '/yes perm-1')
+  assert.equal(decided, true)
+  assert.equal(sends, 1)
+})
+
+/** Verifies that a failed confirmation does not report a successful reset as failed. */
+test('reset confirmation failure does not change successful cleanup', async (testContext) => {
+  testContext.mock.method(console, 'error', () => undefined)
+  /** Records whether reset cleanup ran. */
+  let reset = false
+  /** Counts confirmation attempts. */
+  let sends = 0
+  const handler = createMessageHandler({
+    prompt: async () => 'response',
+    cancel: async () => undefined,
+    reset: async () => { reset = true },
+    decidePermission: async () => null,
+    send: async () => { sends++; throw new Error('WhatsApp unavailable') },
+    allowedNumber: webhookConfig.allowedNumber,
+  })
+  await handler(webhookConfig.allowedNumber, '/reset')
+  assert.equal(reset, true)
+  assert.equal(sends, 1)
+})
+
 /** Verifies that the normal queue rejects a third waiting turn. */
 test('message queue applies backpressure after one waiting turn', async () => {
-  /** Resolver for the blocked first prompt. */
-  let release!: () => void
   /** Promise keeping the first prompt active. */
-  const blocked = new Promise<void>((resolve) => { release = resolve })
+  const blocked = deferred<void>()
   /** Handler whose prompt never finishes until released. */
   const handler = createMessageHandler({
-    prompt: async () => { await blocked; return 'done' },
+    prompt: async () => { await blocked.promise; return 'done' },
     cancel: async () => undefined,
     reset: async () => undefined,
     decidePermission: async () => null,
@@ -149,6 +189,6 @@ test('message queue applies backpressure after one waiting turn', async () => {
   const first = handler(webhookConfig.allowedNumber, 'first')
   const second = handler(webhookConfig.allowedNumber, 'second')
   await assert.rejects(handler(webhookConfig.allowedNumber, 'third'), QueueBusyError)
-  release()
+  blocked.resolve()
   await Promise.all([first, second])
 })

@@ -22,23 +22,18 @@ interface CapturedRequest {
   body: unknown
 }
 
-/** Verifies the real list → prompt → wait → list HTTP contract. */
-test('promptWithContext uses the generated OpenCode V2 HTTP contract', async () => {
-  /** Requests captured by the scripted fetch implementation. */
-  const requests: CapturedRequest[] = []
-  /** Counts message-list calls before and after execution. */
-  let listCalls = 0
-  /** Scripted fetch that returns the minimal OpenCode response shapes. */
-  const fakeFetch: typeof fetch = async (input, init) => {
+/** Creates the scripted network boundary used by the generated-client contract test. */
+function createScriptedFetch(requests: CapturedRequest[], state: { listCalls: number }): typeof fetch {
+  return async (input, init) => {
     const url = new URL(String(input))
     const method = init?.method ?? 'GET'
     const body = init?.body ? JSON.parse(String(init.body)) : undefined
     requests.push({ method, path: url.pathname, search: url.searchParams, headers: new Headers(init?.headers), body })
 
     if (url.pathname === '/api/session/session-1/message') {
-      listCalls++
+      state.listCalls++
       return Response.json({
-        data: listCalls === 1
+        data: state.listCalls === 1
           ? [{ id: 'previous', type: 'assistant', content: [{ type: 'text', text: 'old' }] }]
           : [{ id: 'new', type: 'assistant', content: [{ type: 'text', text: 'new response' }] }],
         cursor: {},
@@ -48,6 +43,16 @@ test('promptWithContext uses the generated OpenCode V2 HTTP contract', async () 
     if (url.pathname === '/api/experimental/session/session-1/wait') return new Response(null, { status: 204 })
     throw new Error(`Unexpected request: ${method} ${url}`)
   }
+}
+
+/** Verifies the real list → prompt → wait → list HTTP contract. */
+test('promptWithContext uses the generated OpenCode V2 HTTP contract', async () => {
+  /** Requests captured by the scripted fetch implementation. */
+  const requests: CapturedRequest[] = []
+  /** Mutable message-list call count used by the scripted fetch. */
+  const state = { listCalls: 0 }
+  /** Scripted fetch that returns the minimal OpenCode response shapes. */
+  const fakeFetch = createScriptedFetch(requests, state)
 
   /** Expected Basic authorization value. */
   const authorization = `Basic ${Buffer.from('opencode:password').toString('base64')}`

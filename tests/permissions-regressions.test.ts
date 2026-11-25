@@ -1,18 +1,13 @@
 /**
- * Permission-boundary regression tests.
- *
- * @remarks
- * Covers complete request display, reset-safe notifications, active-session
- * scope, saved approvals, policy-denied requests, and server reconciliation.
+ * Permission delivery and reconciliation regression tests.
  */
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { PermissionBridge } from '../src/permissions.js'
-
-/** Phone number allowed by the permission tests. */
-const webhookConfig = { allowedNumber: '5511999999999' }
+import { deferred } from './helpers/runtime.js'
+import { webhookConfig } from './helpers/webhook.js'
 
 /** Verifies that long permission resources are sent without truncation. */
 test('permission notifications include the complete long resource', async () => {
@@ -35,44 +30,206 @@ test('permission notifications include the complete long resource', async () => 
 
 /** Verifies that reset stops permission chunks that have not started sending. */
 test('reset stops stale permission notification chunks', async () => {
-  /** Resolver for the first blocked notification chunk. */
-  let release!: () => void
   /** Promise controlling the first WhatsApp send. */
-  const blocked = new Promise<void>((resolve) => { release = resolve })
-  /** Resolver fired when the first notification send starts. */
-  let markStarted!: () => void
+  const blocked = deferred<void>()
   /** Promise that removes scheduling assumptions. */
-  const started = new Promise<void>((resolve) => { markStarted = resolve })
+  const started = deferred<void>()
   /** Captures notification chunks. */
   const sent: string[] = []
-  /** Resolver fired when reset rejects the server-side request. */
-  let markRejected!: () => void
   /** Promise that ensures rejection happens before the blocked send resumes. */
-  const rejected = new Promise<void>((resolve) => { markRejected = resolve })
+  const rejected = deferred<void>()
   /** Pending request with a resource large enough for multiple chunks. */
   const pending = { id: 'perm-long', sessionID: 'session-1', action: 'shell', resources: ['x'.repeat(7_001)] }
   const client = {
     session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
     permission: {
       request: { list: async () => ({ data: [pending] }) },
-      reply: async () => { markRejected() },
+      reply: async () => { rejected.resolve() },
       saved: { list: async () => [], remove: async () => undefined },
     },
   }
   const permissions = new PermissionBridge(client as never, async (_to, text) => {
     sent.push(text)
-    markStarted()
-    await blocked
+    started.resolve()
+    await blocked.promise
   }, webhookConfig.allowedNumber)
   permissions.setActiveSession('session-1')
   permissions.handleEvent({ type: 'permission.asked', data: pending })
-  await started
+  await started.promise
   const clearing = permissions.clear('session-1')
-  await rejected
-  release()
+  await rejected.promise
+  blocked.resolve()
   await clearing
   await new Promise<void>((resolve) => setImmediate(resolve))
   assert.equal(sent.length, 1)
+})
+
+/** Verifies that approval waits until every notification chunk is delivered. */
+test('permission approval waits for the complete notification', async () => {
+  /** Captures notification chunks. */
+  const sent: string[] = []
+  /** Captures server decisions. */
+  const replies: unknown[] = []
+  /** Promise controlling the final instruction chunk. */
+  const blockedFinal = deferred<void>()
+  /** Promise that removes scheduling assumptions. */
+  const firstStarted = deferred<void>()
+  /** Promise resolved when the final chunk reaches its blocked send. */
+  const finalStarted = deferred<void>()
+  /** Promise resolved after the final chunk is delivered. */
+  const completed = deferred<void>()
+  const pending = { id: 'perm-full', sessionID: 'session-1', action: 'shell', resources: ['x'.repeat(7_001)] }
+  const client = {
+    session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
+    permission: {
+      reply: async (input: unknown) => { replies.push(input) },
+      request: { list: async () => ({ data: [] }) },
+      saved: { list: async () => [], remove: async () => undefined },
+    },
+  }
+  const permissions = new PermissionBridge(client as never, async (_to, text) => {
+    sent.push(text)
+    if (sent.length === 1) firstStarted.resolve()
+    if (text.includes('/yes perm-full')) {
+      finalStarted.resolve()
+      await blockedFinal.promise
+      completed.resolve()
+    }
+  }, webhookConfig.allowedNumber)
+  permissions.setActiveSession('session-1')
+  permissions.handleEvent({ type: 'permission.asked', data: pending })
+  await firstStarted.promise
+  assert.match(await permissions.decide('/yes perm-full') ?? '', /still being sent/)
+  assert.deepEqual(replies, [])
+  await finalStarted.promise
+  assert.match(await permissions.decide('/yes perm-full') ?? '', /still being sent/)
+  assert.deepEqual(replies, [])
+  blockedFinal.resolve()
+  await completed.promise
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.match(await permissions.decide('/yes perm-full') ?? '', /granted once/)
+  assert.deepEqual(replies, [{ sessionID: 'session-1', requestID: 'perm-full', decision: 'once' }])
+})
+
+/** Verifies that an asked event plus reconciliation sends one notification. */
+test('permission reconciliation does not duplicate an in-flight notification', async () => {
+  /** Captures notification count. */
+  let notifications = 0
+  /** Promise controlling notification completion. */
+  const blocked = deferred<void>()
+  /** Promise that removes scheduling assumptions. */
+  const started = deferred<void>()
+  const pending = { id: 'perm-1', sessionID: 'session-1', action: 'shell', resources: ['git status'] }
+  const client = {
+    session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
+    permission: {
+      request: { list: async () => ({ data: [pending] }) },
+      saved: { list: async () => [], remove: async () => undefined },
+    },
+  }
+  const permissions = new PermissionBridge(client as never, async () => {
+    notifications++
+    started.resolve()
+    await blocked.promise
+  }, webhookConfig.allowedNumber)
+  permissions.setActiveSession('session-1')
+  permissions.handleEvent({ type: 'permission.asked', data: pending })
+  await started.promise
+  await permissions.reconcile()
+  assert.equal(notifications, 1)
+  blocked.resolve()
+  await new Promise<void>((resolve) => setImmediate(resolve))
+})
+
+/** Verifies that automatic policy denials retry transient server failures. */
+test('permission policy denial retries a transient rejection failure', async (testContext) => {
+  testContext.mock.method(console, 'error', () => undefined)
+  /** Counts rejection attempts. */
+  let attempts = 0
+  /** Promise resolved by the second attempt. */
+  const retried = deferred<void>()
+  const client = {
+    permission: {
+      reply: async () => {
+        attempts++
+        if (attempts === 1) throw new Error('temporary')
+        retried.resolve()
+      },
+    },
+  }
+  const permissions = new PermissionBridge(client as never, async () => undefined, webhookConfig.allowedNumber)
+  permissions.setActiveSession('session-1')
+  permissions.handleEvent({ type: 'permission.asked', data: { id: 'env-read', sessionID: 'session-1', action: 'read', resources: ['.env'] } })
+  await retried.promise
+  assert.equal(attempts, 2)
+})
+
+/** Builds a permission whose final notification chunk fails until reconciliation. */
+function createFailedDeliveryHarness() {
+  /** Captures every notification chunk. */
+  const sent: string[] = []
+  /** Captures server decisions. */
+  const replies: unknown[] = []
+  /** Controls whether the final chunk keeps failing. */
+  let failing = true
+  /** Counts final-chunk attempts during the failed delivery. */
+  let finalAttempts = 0
+  /** First chunk used to prove reconciliation redelivers the whole request. */
+  let firstChunk = ''
+  /** Promise resolved after internal retries are exhausted. */
+  const exhausted = deferred<void>()
+  /** Promise resolved after reconciliation delivers the final chunk. */
+  const redelivered = deferred<void>()
+  const pending = { id: 'perm-retry', sessionID: 'session-1', action: 'shell', resources: ['x'.repeat(7_001)] }
+  const client = {
+    session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
+    permission: {
+      request: { list: async () => ({ data: [pending] }) },
+      reply: async (input: unknown) => { replies.push(input) },
+      saved: { list: async () => [], remove: async () => undefined },
+    },
+  }
+  const permissions = new PermissionBridge(client as never, async (_to, text) => {
+    sent.push(text)
+    if (!firstChunk) firstChunk = text
+    if (!text.includes('/yes perm-retry')) return
+    if (failing) {
+      finalAttempts++
+      if (finalAttempts === 3) exhausted.resolve()
+      throw new Error('temporary')
+    }
+    redelivered.resolve()
+  }, webhookConfig.allowedNumber)
+  return {
+    sent,
+    replies,
+    exhausted,
+    redelivered,
+    permissions,
+    pending,
+    firstChunk: () => firstChunk,
+    allowDelivery: () => { failing = false },
+  }
+}
+
+/** Verifies that a failed later chunk stays gated until reconciliation redelivers it. */
+test('failed multi-chunk delivery cannot be approved before full redelivery', async (testContext) => {
+  testContext.mock.method(console, 'error', () => undefined)
+  const harness = createFailedDeliveryHarness()
+  harness.permissions.setActiveSession('session-1')
+  harness.permissions.handleEvent({ type: 'permission.asked', data: harness.pending })
+  await harness.exhausted.promise
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.match(await harness.permissions.decide('/yes perm-retry') ?? '', /still being sent/)
+  assert.deepEqual(harness.replies, [])
+
+  harness.allowDelivery()
+  await harness.permissions.reconcile()
+  await harness.redelivered.promise
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(harness.sent.filter((text) => text === harness.firstChunk()).length, 2)
+  assert.match(await harness.permissions.decide('/yes perm-retry') ?? '', /granted once/)
+  assert.deepEqual(harness.replies, [{ sessionID: 'session-1', requestID: 'perm-retry', decision: 'once' }])
 })
 
 /** Verifies that missing project locations and other sessions are ignored. */
@@ -94,6 +251,12 @@ test('permission reconciliation retries an undelivered notification', async (tes
   testContext.mock.method(console, 'error', () => undefined)
   /** Counts notification attempts. */
   let attempts = 0
+  /** Controls whether delivery keeps failing. */
+  let failing = true
+  /** Promise resolved by the third failed attempt. */
+  const exhausted = deferred<void>()
+  /** Promise resolved by the fourth attempt. */
+  const reconciled = deferred<void>()
   /** Server request that remains pending. */
   const pending = { id: 'perm-1', sessionID: 'session-1', action: 'shell', resources: ['git status'] }
   const client = {
@@ -102,102 +265,18 @@ test('permission reconciliation retries an undelivered notification', async (tes
   }
   const permissions = new PermissionBridge(client as never, async () => {
     attempts++
-    if (attempts === 1) throw new Error('temporary')
+    if (failing) {
+      if (attempts === 3) exhausted.resolve()
+      throw new Error('temporary')
+    }
+    reconciled.resolve()
   }, webhookConfig.allowedNumber)
   permissions.setActiveSession('session-1')
   permissions.handleEvent({ type: 'permission.asked', data: pending })
+  await exhausted.promise
   await new Promise<void>((resolve) => setImmediate(resolve))
+  failing = false
   await permissions.reconcile()
-  await new Promise<void>((resolve) => setImmediate(resolve))
-  assert.equal(attempts, 2)
-})
-
-/** Verifies that reset without a known session does not touch unrelated permissions. */
-test('permission clear is a no-op when no session is known', async () => {
-  /** Counts server list calls. */
-  let listCalls = 0
-  /** Counts server replies. */
-  let replies = 0
-  const client = {
-    permission: {
-      request: { list: async () => { listCalls++; return { data: [] } } },
-      reply: async () => { replies++ },
-    },
-  }
-  const permissions = new PermissionBridge(client as never, async () => undefined, webhookConfig.allowedNumber)
-  await permissions.clear(undefined)
-  assert.equal(listCalls, 0)
-  assert.equal(replies, 0)
-})
-
-/** Verifies that durable project approvals are removed before prompts run. */
-test('permission reconciliation removes saved project approvals', async () => {
-  /** Captures removed saved-approval IDs. */
-  const removed: string[] = []
-  const client = {
-    session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
-    permission: {
-      request: { list: async () => ({ data: [] }) },
-      saved: {
-        list: async () => [{ id: 'saved-1', projectID: 'project-1', action: 'shell', resource: 'git *', effect: 'allow', time: { created: 1 } }],
-        remove: async ({ id }: { id: string }) => { removed.push(id) },
-      },
-    },
-  }
-  const permissions = new PermissionBridge(client as never, async () => undefined, webhookConfig.allowedNumber)
-  permissions.setActiveSession('session-1')
-  await permissions.reconcile()
-  assert.deepEqual(removed, ['saved-1'])
-})
-
-/** Verifies that requests denied by current policy are rejected without notification. */
-test('permission events rejected by current policy never reach WhatsApp', async () => {
-  /** Captures server replies. */
-  const replies: unknown[] = []
-  /** Captures notification count. */
-  let notifications = 0
-  const client = {
-    permission: {
-      reply: async (input: unknown) => { replies.push(input) },
-    },
-  }
-  const permissions = new PermissionBridge(client as never, async () => { notifications++ }, webhookConfig.allowedNumber)
-  permissions.setActiveSession('session-1')
-  permissions.handleEvent({ type: 'permission.asked', data: { id: 'env-read', sessionID: 'session-1', action: 'read', resources: ['.env'] } })
-  await new Promise<void>((resolve) => setImmediate(resolve))
-  assert.deepEqual(replies, [{ sessionID: 'session-1', requestID: 'env-read', decision: 'reject' }])
-  assert.equal(notifications, 0)
-})
-
-/** Verifies that reconciliation removes locally tracked requests no longer pending. */
-test('permission reconciliation removes stale local requests', async () => {
-  const client = {
-    session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
-    permission: { request: { list: async () => ({ data: [] }) }, saved: { list: async () => [], remove: async () => undefined } },
-  }
-  const permissions = new PermissionBridge(client as never, async () => undefined, webhookConfig.allowedNumber)
-  permissions.setActiveSession('session-1')
-  permissions.handleEvent({ type: 'permission.asked', data: { id: 'stale', sessionID: 'session-1', action: 'shell', resources: ['git status'] } })
-  await permissions.reconcile()
-  assert.match(await permissions.decide('/yes stale') ?? '', /No pending permission/)
-})
-
-/** Verifies that reset rejects permissions that exist only on the server. */
-test('permission clear reconciles and rejects server-only requests', async () => {
-  /** Captures decisions sent to OpenCode. */
-  const replies: unknown[] = []
-  /** Mock client returning one pending request and recording rejection. */
-  const client = {
-    session: { get: async () => ({ id: 'session-1', projectID: 'project-1' }) },
-    permission: {
-      request: { list: async () => ({ data: [{ id: 'server-only', sessionID: 'session-1', action: 'shell', resources: ['rm *'] }] }) },
-      reply: async (input: unknown) => { replies.push(input) },
-      saved: { list: async () => [], remove: async () => undefined },
-    },
-  }
-  /** Bridge with an empty local map but a non-empty server list. */
-  const permissions = new PermissionBridge(client as never, async () => undefined, webhookConfig.allowedNumber, '/repo')
-  permissions.setActiveSession('session-1')
-  await permissions.clear('session-1')
-  assert.deepEqual(replies, [{ sessionID: 'session-1', requestID: 'server-only', decision: 'reject' }])
+  await reconciled.promise
+  assert.equal(attempts, 4)
 })

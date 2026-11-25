@@ -9,66 +9,58 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { Config } from '../src/config.js'
-import { createMessageRuntime } from '../src/runtime.js'
+import { createRuntimeHarness, deferred, webhookConfig } from './helpers/runtime.js'
 
-/** Phone number allowed by the runtime tests. */
-const owner = '5511999999999'
-
-/** Complete configuration fixture used by the runtime tests. */
-const config: Config = {
-  openCodeUrl: 'http://127.0.0.1:4096',
-  openCodePassword: 'opencode-password-with-32-characters',
-  workdir: 'C:/Github/zapcode',
-  knowledgeDir: 'C:/Github/zapcode/knowledge',
-  sessionFile: 'C:/Github/zapcode/data/session.json',
-  evolutionUrl: 'http://evolution',
-  evolutionApiKey: 'api-key',
-  evolutionInstance: 'zapcode',
-  allowedNumber: owner,
-  webhookSecret: 'webhook-secret-with-32-characters',
-  port: 3000,
+/** Runtime harness callbacks used by reset race tests. */
+interface ResetHarnessCallbacks {
+  /** Called if stale work reaches prompt admission. */
+  onPrompt?: () => void
+  /** Called for each inbox cancellation attempt. */
+  onCancel?: (input: unknown) => void
+  /** Called when persisted session cleanup runs. */
+  onReset?: () => void
+  /** Called when permission cleanup runs. */
+  onPermissionsClear?: () => void
 }
 
-/**
- * Creates a manually controlled promise.
- *
- * @returns The pending promise and its resolver.
- */
-function deferred<T>() {
-  /** Resolver captured from the promise constructor. */
-  let resolve!: (value: T) => void
-  /** Promise completed later by the test. */
-  const promise = new Promise<T>((done) => { resolve = done })
-  return { promise, resolve }
-}
-
-/** Builds the shared session and permission doubles used by reset-race tests. */
-function createStateDoubles() {
-  return {
+/** Builds the shared paused-session reset harness. */
+function createResetHarness(
+  session: { promise: Promise<string> },
+  callbacks: ResetHarnessCallbacks = {},
+): ReturnType<typeof createRuntimeHarness> {
+  return createRuntimeHarness({
+    client: {
+      session: {
+        prompt: async () => { callbacks.onPrompt?.(); return { id: 'msg-old' } },
+        inbox: { cancel: async (input: unknown) => { callbacks.onCancel?.(input) } },
+        interrupt: async () => ({ interrupted: true }),
+      },
+    },
     sessions: {
-      ensure: () => Promise.resolve('session-1'),
-      reset: async () => undefined,
-      currentSessionID: async () => 'session-1',
-      getActiveRun: async () => undefined,
-      markActive: async () => undefined,
-      clearActive: async () => undefined,
+      ensure: () => session.promise,
+      reset: async () => { callbacks.onReset?.() },
     },
-    permissions: {
-      clear: async () => undefined,
-      decide: async () => null,
-      setActiveSession: () => undefined,
-      reconcile: async () => undefined,
-    },
-  }
+    permissions: { clear: async () => { callbacks.onPermissionsClear?.() } },
+  })
+}
+
+/** Runs reset while session creation is paused, then releases the stale setup. */
+async function resetDuringSessionCreation(
+  harness: ReturnType<typeof createRuntimeHarness>,
+  session: { promise: Promise<string>; resolve: (value: string) => void },
+): Promise<void> {
+  const pending = harness.runtime.handler(webhookConfig.allowedNumber, 'old task')
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const resetting = harness.runtime.handler(webhookConfig.allowedNumber, '/reset')
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  session.resolve('session-old')
+  await Promise.all([pending, resetting])
 }
 
 /** Verifies that reset during session creation prevents old prompt admission. */
 test('reset before sessions.ensure prevents old admission and cleans up afterwards', async () => {
   /** Deferred session ID used to pause `sessions.ensure()`. */
   const session = deferred<string>()
-  /** Captures WhatsApp messages sent by the runtime. */
-  const sent: string[] = []
   /** Captures OpenCode inbox cancellation requests. */
   const cancelled: unknown[] = []
   /** Records whether the stale prompt reached OpenCode. */
@@ -77,39 +69,14 @@ test('reset before sessions.ensure prevents old admission and cleans up afterwar
   let reset = false
   /** Records whether pending permissions were cleared. */
   let permissionsCleared = false
-  /** Original global fetch restored after the test. */
-  const originalFetch = globalThis.fetch
-  /** Fetch mock that captures Evolution text messages. */
-  globalThis.fetch = async (_input, init) => {
-    /** Parsed Evolution request body. */
-    const body = JSON.parse(String(init?.body))
-    sent.push(body.textMessage.text)
-    return Response.json({})
-  }
-  /** Mock OpenCode client with prompt and cancellation spies. */
-  const client = {
-    session: {
-      prompt: async () => { admitted = true; return { id: 'msg-old' } },
-      inbox: { cancel: async (input: unknown) => { cancelled.push(input) } },
-      interrupt: async () => ({ interrupted: true }),
-    },
-  }
-  /** Shared doubles customized for this race. */
-  const doubles = createStateDoubles()
-  doubles.sessions.ensure = () => session.promise
-  doubles.sessions.reset = async () => { reset = true }
-  doubles.permissions.clear = async () => { permissionsCleared = true }
+  const harness = createResetHarness(session, {
+    onPrompt: () => { admitted = true },
+    onCancel: (input) => { cancelled.push(input) },
+    onReset: () => { reset = true },
+    onPermissionsClear: () => { permissionsCleared = true },
+  })
   try {
-    /** Runtime assembled from the mocked boundaries. */
-    const runtime = createMessageRuntime({ config, client: client as never, sessions: doubles.sessions as never, permissions: doubles.permissions as never })
-    /** Old prompt paused inside session creation. */
-    const pending = runtime.handler(owner, 'old task')
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    /** Reset operation started while the old prompt is still pre-admission. */
-    const resetting = runtime.handler(owner, '/reset')
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    session.resolve('session-old')
-    await Promise.all([pending, resetting])
+    await resetDuringSessionCreation(harness, session)
 
     assert.equal(admitted, false)
     assert.equal(reset, true)
@@ -117,9 +84,75 @@ test('reset before sessions.ensure prevents old admission and cleans up afterwar
     assert.ok(cancelled.length >= 1)
     assert.ok(cancelled.every((item) => (item as { sessionID: string }).sessionID === 'session-old'))
     assert.match((cancelled[0] as { inboxID: string }).inboxID, /^msg_/)
-    assert.deepEqual(sent, ['Saved session cleared. Your next message starts with a clean context.'])
+    assert.deepEqual(harness.sent, ['Saved session cleared. Your next message starts with a clean context.'])
   } finally {
-    globalThis.fetch = originalFetch
+    harness.restore()
+  }
+})
+
+/** Verifies that permission events are suppressed while server session removal is pending. */
+test('/reset deactivates permission events before server session removal', async () => {
+  /** Promise resolved when server session removal starts. */
+  const resetStarted = deferred<void>()
+  /** Promise controlling server session removal. */
+  const releaseReset = deferred<void>()
+  /** Permission session currently selected by the bridge. */
+  let activeSession: string | undefined
+  /** Captures stale approval notifications. */
+  const notifications: string[] = []
+  const permissions = {
+    clear: async () => undefined,
+    decide: async () => null,
+    setActiveSession: (sessionID: string | undefined) => { activeSession = sessionID },
+    reconcile: async () => undefined,
+    receiveAsked: () => { if (activeSession) notifications.push('late') },
+  }
+  const harness = createRuntimeHarness({
+    sessions: {
+      reset: async () => {
+        resetStarted.resolve()
+        await releaseReset.promise
+      },
+    },
+    permissions,
+  })
+  try {
+    const resetting = harness.runtime.handler(webhookConfig.allowedNumber, '/reset')
+    await resetStarted.promise
+    permissions.receiveAsked()
+    assert.deepEqual(notifications, [])
+    releaseReset.resolve()
+    await resetting
+    assert.equal(activeSession, undefined)
+  } finally {
+    harness.restore()
+  }
+})
+
+/** Verifies that failed server removal restores permission routing. */
+test('/reset restores the permission session when server removal fails', async (testContext) => {
+  testContext.mock.method(console, 'error', () => undefined)
+  /** Permission session currently selected by the bridge. */
+  let activeSession: string | undefined
+  /** Counts permission reconciliation attempts after failure. */
+  let reconciles = 0
+  const permissions = {
+    clear: async () => undefined,
+    decide: async () => null,
+    setActiveSession: (sessionID: string | undefined) => { activeSession = sessionID },
+    reconcile: async () => { reconciles++ },
+  }
+  const harness = createRuntimeHarness({
+    sessions: { reset: async () => { throw new Error('remove failed') } },
+    permissions,
+  })
+  try {
+    await harness.runtime.handler(webhookConfig.allowedNumber, '/reset')
+    assert.equal(activeSession, 'session-1')
+    assert.equal(reconciles, 1)
+    assert.deepEqual(harness.sent, ['I could not reset the session. Try again.'])
+  } finally {
+    harness.restore()
   }
 })
 
@@ -128,52 +161,25 @@ test('reset does not confirm success when cancellation fails', async (testContex
   testContext.mock.method(console, 'error', () => undefined)
   /** Deferred session ID used to pause `sessions.ensure()`. */
   const session = deferred<string>()
-  /** Captures WhatsApp messages sent by the runtime. */
-  const sent: string[] = []
   /** Records whether persisted session cleanup ran. */
   let reset = false
   /** Records whether pending permissions were cleared. */
   let permissionsCleared = false
   /** Counts failed inbox cancellation attempts. */
   let cancelAttempts = 0
-  /** Original global fetch restored after the test. */
-  const originalFetch = globalThis.fetch
-  /** Fetch mock that captures Evolution text messages. */
-  globalThis.fetch = async (_input, init) => {
-    /** Parsed Evolution request body. */
-    const body = JSON.parse(String(init?.body))
-    sent.push(body.textMessage.text)
-    return Response.json({})
-  }
-  /** Mock OpenCode client whose inbox cancellation always fails. */
-  const client = {
-    session: {
-      inbox: { cancel: async () => { cancelAttempts++; throw new Error('no connection') } },
-      interrupt: async () => ({ interrupted: true }),
-    },
-  }
-  /** Shared doubles customized for this race. */
-  const doubles = createStateDoubles()
-  doubles.sessions.ensure = () => session.promise
-  doubles.sessions.reset = async () => { reset = true }
-  doubles.permissions.clear = async () => { permissionsCleared = true }
+  const harness = createResetHarness(session, {
+    onCancel: () => { cancelAttempts++; throw new Error('no connection') },
+    onReset: () => { reset = true },
+    onPermissionsClear: () => { permissionsCleared = true },
+  })
   try {
-    /** Runtime assembled from the mocked boundaries. */
-    const runtime = createMessageRuntime({ config, client: client as never, sessions: doubles.sessions as never, permissions: doubles.permissions as never })
-    /** Old prompt paused inside session creation. */
-    const pending = runtime.handler(owner, 'old task')
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    /** Reset operation that must fail closed. */
-    const resetting = runtime.handler(owner, '/reset')
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    session.resolve('session-old')
-    await Promise.all([pending, resetting])
+    await resetDuringSessionCreation(harness, session)
 
     assert.equal(cancelAttempts, 1)
     assert.equal(reset, false)
     assert.equal(permissionsCleared, false)
-    assert.deepEqual(sent, ['I could not reset the session. Try again.'])
+    assert.deepEqual(harness.sent, ['I could not reset the session. Try again.'])
   } finally {
-    globalThis.fetch = originalFetch
+    harness.restore()
   }
 })
