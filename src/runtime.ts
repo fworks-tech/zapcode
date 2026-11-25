@@ -11,16 +11,17 @@ import { randomUUID } from 'node:crypto'
 
 import type { Config } from './config.js'
 import { createMessageHandler, RetryableMessageError } from './handler.js'
-import { loadKnowledge } from './knowledge.js'
+import { KnowledgeLimitError, loadKnowledge } from './knowledge.js'
 import {
   cancelExecution,
   CancellationNotConfirmedError,
   ExecutionCancelledError,
+  PreAdmissionError,
   promptWithContext,
   type OpenCodeClient,
 } from './opencode.js'
 import type { PermissionBridge } from './permissions.js'
-import type { SessionStore } from './session.js'
+import { SessionConfigurationError, SessionStateError, type SessionStore } from './session.js'
 import { sendText } from './whatsapp.js'
 
 /** External services required by the message runtime. */
@@ -108,6 +109,81 @@ function recoveredRun(saved: { sessionID: string; inboxID: string }): ActiveRun 
   }
 }
 
+/** Throws when reset invalidated the expected execution generation. */
+function assertCurrent(state: RuntimeState, expectedGeneration: number): void {
+  if (state.generation !== expectedGeneration) throw new ExecutionCancelledError()
+}
+
+/** Creates or loads the session, reconciles permissions, and loads knowledge. */
+async function preparePrompt(
+  state: RuntimeState,
+  deps: RuntimeDeps,
+  run: ActiveRun,
+  expectedGeneration: number,
+): Promise<{ sessionID: string; knowledge: string[] }> {
+  const sessionID = await deps.sessions.ensure()
+  run.sessionID = sessionID
+  assertCurrent(state, expectedGeneration)
+  state.activeSessionID = sessionID
+  deps.permissions.setActiveSession(sessionID)
+  await deps.permissions.reconcile()
+  assertCurrent(state, expectedGeneration)
+  await deps.sessions.markActive(run.inboxID)
+  assertCurrent(state, expectedGeneration)
+  const knowledge = await loadKnowledge(deps.config.knowledgeDir)
+  assertCurrent(state, expectedGeneration)
+  console.info(JSON.stringify({ event: 'opencode.prompt', sessionID }))
+  return { sessionID, knowledge }
+}
+
+/** Returns whether setup failed for a reason retrying cannot fix. */
+function isPermanentSetupError(error: unknown): boolean {
+  return error instanceof SessionStateError || error instanceof SessionConfigurationError || error instanceof KnowledgeLimitError
+}
+
+/** Converts a prompt failure into cleanup and retry decisions. */
+function classifyPromptFailure(error: unknown, enteredPrompt: boolean): {
+  keepActive: boolean
+  resetOwnsCleanup: boolean
+  error: unknown
+} {
+  if (error instanceof ExecutionCancelledError) return { keepActive: false, resetOwnsCleanup: true, error }
+  if (error instanceof CancellationNotConfirmedError) return { keepActive: true, resetOwnsCleanup: false, error }
+  if (isPermanentSetupError(error)) return { keepActive: false, resetOwnsCleanup: false, error }
+  if (error instanceof PreAdmissionError && error.retryable) {
+    return { keepActive: false, resetOwnsCleanup: false, error: new RetryableMessageError() }
+  }
+  if (!enteredPrompt) return { keepActive: false, resetOwnsCleanup: false, error: new RetryableMessageError() }
+  return { keepActive: false, resetOwnsCleanup: false, error }
+}
+
+/** Creates abort and completion bookkeeping for one prompt. */
+function createActiveRun(): { run: ActiveRun; finish: () => void } {
+  const controller = new AbortController()
+  let finish!: () => void
+  const finished = new Promise<void>((resolve) => { finish = resolve })
+  return { run: { inboxID: `msg_${randomUUID()}`, controller, finished }, finish }
+}
+
+/** Registers one prompt after shutdown and restart-recovery checks. */
+async function beginPrompt(
+  state: RuntimeState,
+  deps: RuntimeDeps,
+): Promise<{ run: ActiveRun; finish: () => void; expectedGeneration: number }> {
+  if (state.shuttingDown) throw new Error('zapcode is shutting down.')
+  if (state.activeRun) throw new Error('The previous execution has not been cancelled. Send /reset to try again.')
+  const expectedGeneration = state.generation
+  const persisted = await deps.sessions.getActiveRun()
+  assertCurrent(state, expectedGeneration)
+  if (persisted) {
+    state.activeRun = recoveredRun(persisted)
+    throw new Error('The previous execution has not been cancelled. Send /reset to try again.')
+  }
+  const { run, finish } = createActiveRun()
+  state.activeRun = run
+  return { run, finish, expectedGeneration }
+}
+
 /**
  * Creates the normal-prompt executor used by the command handler.
  *
@@ -117,66 +193,28 @@ function recoveredRun(saved: { sessionID: string; inboxID: string }): ActiveRun 
  */
 function createPromptExecutor(state: RuntimeState, deps: RuntimeDeps) {
   return async (text: string): Promise<string> => {
-    if (state.shuttingDown) throw new Error('zapcode is shutting down.')
-    if (state.activeRun) throw new Error('The previous execution has not been cancelled. Send /reset to try again.')
-    /** Generation captured before the first asynchronous recovery read. */
-    const expectedGeneration = state.generation
-    const persisted = await deps.sessions.getActiveRun()
-    if (expectedGeneration !== state.generation) throw new ExecutionCancelledError()
-    if (persisted) {
-      state.activeRun = recoveredRun(persisted)
-      throw new Error('The previous execution has not been cancelled. Send /reset to try again.')
-    }
-
-    /** Reset-owned abort controller for this execution. */
-    const controller = new AbortController()
-    /** Resolver assigned by the `finished` promise constructor. */
-    let finish!: () => void
-    /** Completion signal awaited by `/reset`. */
-    const finished = new Promise<void>((resolve) => { finish = resolve })
-    /** Bookkeeping registered before session creation starts. */
-    const run: ActiveRun = { inboxID: `msg_${randomUUID()}`, controller, finished }
-    state.activeRun = run
+    const { run, finish, expectedGeneration } = await beginPrompt(state, deps)
     /** Keeps the run tracked when server-side cancellation fails. */
     let keepActive = false
     /** Records whether reset, rather than normal completion, owns cleanup. */
     let resetOwnsCleanup = false
-    /** Records whether `session.prompt` was attempted. */
-    let promptAttempted = false
+    /** Records whether control passed to the OpenCode prompt helper. */
+    let enteredPrompt = false
     try {
-      /** Persistent session created or loaded before prompt admission. */
-      const sessionID = await deps.sessions.ensure()
-      run.sessionID = sessionID
-      if (expectedGeneration !== state.generation) throw new ExecutionCancelledError()
-      state.activeSessionID = sessionID
-      deps.permissions.setActiveSession(sessionID)
-      await deps.permissions.reconcile()
-      if (expectedGeneration !== state.generation) throw new ExecutionCancelledError()
-      await deps.sessions.markActive(run.inboxID)
-      if (expectedGeneration !== state.generation) throw new ExecutionCancelledError()
-      /** Markdown knowledge loaded for this prompt. */
-      const knowledge = await loadKnowledge(deps.config.knowledgeDir)
-      if (expectedGeneration !== state.generation) throw new ExecutionCancelledError()
-      console.info(JSON.stringify({ event: 'opencode.prompt', sessionID }))
+      const { sessionID, knowledge } = await preparePrompt(state, deps, run, expectedGeneration)
+      enteredPrompt = true
       return await promptWithContext(deps.client, sessionID, {
         text,
         knowledge,
         promptID: run.inboxID,
-        signal: controller.signal,
+        signal: run.controller.signal,
         isCurrent: () => state.generation === expectedGeneration,
-        onPromptAttempt: () => { promptAttempted = true },
       })
     } catch (error) {
-      if (error instanceof ExecutionCancelledError) {
-        resetOwnsCleanup = true
-      } else if (error instanceof CancellationNotConfirmedError) {
-        keepActive = true
-      } else if (!promptAttempted) {
-        throw new RetryableMessageError()
-      } else if (!await confirmCancellation(deps, run)) {
-        keepActive = true
-      }
-      throw error
+      const failure = classifyPromptFailure(error, enteredPrompt)
+      keepActive = failure.keepActive
+      resetOwnsCleanup = failure.resetOwnsCleanup
+      throw failure.error
     } finally {
       finish()
       if (!keepActive && !resetOwnsCleanup) await deps.sessions.clearActive(run.inboxID)
@@ -233,9 +271,22 @@ export function createMessageRuntime(deps: RuntimeDeps) {
     cancel: createCancelExecutor(state, deps),
     reset: async () => {
       const sessionID = state.activeSessionID ?? await deps.sessions.currentSessionID()
-      if (sessionID) deps.permissions.setActiveSession(sessionID)
-      await deps.permissions.clear(sessionID)
-      await deps.sessions.reset(sessionID)
+      if (sessionID) {
+        deps.permissions.setActiveSession(sessionID)
+        await deps.permissions.clear(sessionID)
+        deps.permissions.setActiveSession(undefined)
+      }
+      try {
+        await deps.sessions.reset(sessionID)
+      } catch (error) {
+        if (sessionID) {
+          state.activeSessionID = sessionID
+          deps.permissions.setActiveSession(sessionID)
+          await deps.permissions.reconcile().catch((reconcileError) =>
+            console.error('Failed to restore permission state after reset failure.', reconcileError))
+        }
+        throw error
+      }
       state.activeSessionID = undefined
       deps.permissions.setActiveSession(undefined)
     },
