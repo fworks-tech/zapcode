@@ -17,7 +17,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Normalized text message extracted from an Evolution payload. */
-interface IncomingMessage {
+export interface IncomingMessage {
   /** Digits-only sender phone number. */
   from: string
   /** Message text, or `undefined` for an accepted event without text. */
@@ -41,6 +41,22 @@ function isDirectWhatsAppJid(value: string): boolean {
   return /^\d+(?::\d+)?@s\.whatsapp\.net$/.test(value)
 }
 
+/** Extracts text from supported Baileys message shapes. */
+function extractText(message: unknown): string | undefined | null {
+  if (message === undefined) return undefined
+  if (isRecord(message) && typeof message.conversation === 'string') return message.conversation
+  if (isRecord(message) && isRecord(message.extendedTextMessage) && typeof message.extendedTextMessage.text === 'string') {
+    return message.extendedTextMessage.text
+  }
+  return null
+}
+
+/** Returns the direct sender JID for an incoming message key. */
+function incomingJid(key: Record<string, unknown>): string | null {
+  if (typeof key.remoteJid !== 'string' || key.fromMe === true) return null
+  return isDirectWhatsAppJid(key.remoteJid) ? key.remoteJid : null
+}
+
 /**
  * Extracts a supported incoming message from an Evolution webhook body.
  *
@@ -49,28 +65,14 @@ function isDirectWhatsAppJid(value: string): boolean {
  */
 export function extractIncoming(body: unknown): IncomingMessage | null {
   if (!isRecord(body) || !isRecord(body.data) || !isRecord(body.data.key)) return null
-
-  /** Evolution message key containing sender and message metadata. */
   const key = body.data.key
-  if (typeof key.remoteJid !== 'string' || key.fromMe === true) return null
-  if (!isDirectWhatsAppJid(key.remoteJid)) return null
-
-  /** Raw Baileys message object. */
-  const message = body.data.message
-  /** Text extracted from supported message shapes. */
-  let text: string | undefined
-  if (message === undefined) {
-    text = undefined
-  } else if (isRecord(message) && typeof message.conversation === 'string') {
-    text = message.conversation
-  } else if (isRecord(message) && isRecord(message.extendedTextMessage) && typeof message.extendedTextMessage.text === 'string') {
-    text = message.extendedTextMessage.text
-  } else {
-    return null
-  }
+  const remoteJid = incomingJid(key)
+  if (!remoteJid) return null
+  const text = extractText(body.data.message)
+  if (text === null) return null
 
   return {
-    from: normalizeNumber(key.remoteJid),
+    from: normalizeNumber(remoteJid),
     text,
     ...(typeof key.id === 'string' ? { id: key.id } : {}),
   }

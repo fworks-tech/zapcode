@@ -11,7 +11,7 @@ import { timingSafeEqual } from 'node:crypto'
 import express, { type ErrorRequestHandler, type NextFunction, type Request, type Response } from 'express'
 
 import type { Config } from './config.js'
-import { extractIncoming, normalizeNumber } from './webhook.js'
+import { extractIncoming, normalizeNumber, type IncomingMessage } from './webhook.js'
 
 /** Handles one accepted WhatsApp message. */
 type MessageHandler = (from: string, text: string, id?: string) => Promise<void>
@@ -82,6 +82,30 @@ function releaseMessage(seen: Map<string, MessageState>, id: string | undefined)
   if (id) seen.delete(id)
 }
 
+/** Result of validating an Evolution webhook body. */
+type WebhookValidation =
+  | { incoming: IncomingMessage & { text: string; id: string } }
+  | { status: 400 | 403; error: string }
+  | { ignored: true }
+
+/** Validates event, JID, allowlist, message shape, and text. */
+function validateWebhook(body: unknown, allowedNumber: string): WebhookValidation {
+  const payload = body as { event?: unknown; data?: { key?: { remoteJid?: unknown } } } | undefined
+  if (payload?.event !== 'messages.upsert') return { ignored: true }
+  const remoteJid = payload.data?.key?.remoteJid
+  if (typeof remoteJid !== 'string') return { status: 400, error: 'invalid payload' }
+  if (!/^(?:\d+(?::\d+)?@s\.whatsapp\.net|\d+@g\.us|\d+@broadcast)$/.test(remoteJid)) {
+    return { status: 400, error: 'invalid payload' }
+  }
+  if (remoteJid.endsWith('@s.whatsapp.net') && normalizeNumber(remoteJid) !== allowedNumber) {
+    return { status: 403, error: 'forbidden' }
+  }
+  const incoming = extractIncoming(body)
+  if (!incoming || !incoming.text?.trim()) return { ignored: true }
+  if (!incoming.id?.trim()) return { status: 400, error: 'missing message id' }
+  return { incoming: incoming as IncomingMessage & { text: string; id: string } }
+}
+
 /**
  * Creates the Express handler for `POST /webhook` after authentication and parsing.
  *
@@ -93,35 +117,16 @@ function releaseMessage(seen: Map<string, MessageState>, id: string | undefined)
 function webhookHandler(config: WebhookConfig, handleMessage: MessageHandler, seen: Map<string, MessageState>) {
   return async (request: Request, response: Response, next: NextFunction): Promise<void> => {
     try {
-      if (request.body?.event !== 'messages.upsert') {
+      const validation = validateWebhook(request.body, config.allowedNumber)
+      if ('ignored' in validation) {
         response.json({ ignored: true })
         return
       }
-      const remoteJid = request.body?.data?.key?.remoteJid
-      if (typeof remoteJid !== 'string') {
-        response.status(400).json({ error: 'invalid payload' })
+      if ('status' in validation) {
+        response.status(validation.status).json({ error: validation.error })
         return
       }
-      if (!/^(?:\d+(?::\d+)?@s\.whatsapp\.net|\d+@g\.us|\d+@broadcast)$/.test(remoteJid)) {
-        response.status(400).json({ error: 'invalid payload' })
-        return
-      }
-      if (remoteJid.endsWith('@s.whatsapp.net') && normalizeNumber(remoteJid) !== config.allowedNumber) {
-        response.status(403).json({ error: 'forbidden' })
-        return
-      }
-
-      /** Validated incoming message extracted from the Evolution payload. */
-      const incoming = extractIncoming(request.body)
-      if (!incoming) {
-        response.json({ ignored: true })
-        return
-      }
-      if (!incoming.text?.trim()) {
-        response.json({ ignored: true })
-        return
-      }
-
+      const incoming = validation.incoming
       const claim = claimMessage(seen, incoming.id)
       if (claim === 'duplicate') {
         response.json({ duplicate: true })
