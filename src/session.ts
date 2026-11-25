@@ -7,10 +7,11 @@
  * current permission policy before they are returned to the runtime.
  */
 
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
-import { SAFE_PERMISSIONS } from './permissions.js'
+import { SAFE_PERMISSIONS, isNotFound, samePath } from './permission-policy.js'
 
 /** Request options accepted by the OpenCode control calls used here. */
 interface ControlOptions {
@@ -52,6 +53,24 @@ interface SessionClient {
   }
 }
 
+/** Signals that persisted session state is unsafe to overwrite automatically. */
+export class SessionStateError extends Error {
+  /** Creates a session-state error with recovery guidance. */
+  constructor(message: string) {
+    super(message)
+    this.name = 'SessionStateError'
+  }
+}
+
+/** Signals that saved or server session configuration requires an explicit reset. */
+export class SessionConfigurationError extends Error {
+  /** Creates a non-retryable session-configuration error with recovery guidance. */
+  constructor(message: string) {
+    super(message)
+    this.name = 'SessionConfigurationError'
+  }
+}
+
 /** Active prompt bookkeeping persisted for restart recovery. */
 interface SavedActiveRun {
   /** Stable inbox ID used when the prompt was admitted. */
@@ -73,22 +92,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Returns whether an error represents OpenCode's HTTP 404 response. */
-function isNotFound(error: unknown): boolean {
-  const value = error as { name?: unknown; status?: unknown; response?: { status?: unknown } } | null
-  return value?.status === 404 || value?.response?.status === 404 ||
-    (typeof value?.name === 'string' && value.name.endsWith('NotFoundError'))
+/** Throws the stable fail-closed error for an invalid session shape. */
+function invalidSessionShape(): never {
+  throw new SessionStateError('Invalid data/session.json shape. Back up or remove the file before retrying.')
 }
 
-/** Returns whether two filesystem paths identify the same directory. */
-function samePath(left: string, right: string): boolean {
-  const actual = path.resolve(left)
-  const expected = path.resolve(right)
-  return process.platform === 'win32' ? actual.toLowerCase() === expected.toLowerCase() : actual === expected
+/** Validates optional active-run bookkeeping. */
+function parseActiveRun(value: Record<string, unknown>): SavedActiveRun | undefined {
+  if (!('activeRun' in value)) return undefined
+  const activeRun = value.activeRun
+  if (!isRecord(activeRun) || typeof activeRun.inboxID !== 'string' || activeRun.inboxID.length === 0) {
+    throw new SessionStateError('Invalid activeRun in data/session.json. Back up or remove the file before retrying.')
+  }
+  return { inboxID: activeRun.inboxID }
 }
 
 /** Creates, reuses, recovers, and deletes the bridge's one OpenCode session. */
 export class SessionStore {
+  /** Serializes atomic writes for this store instance. */
+  private writeQueue: Promise<void> = Promise.resolve()
+
   /**
    * Creates a session store.
    *
@@ -111,13 +134,13 @@ export class SessionStore {
     const signal = AbortSignal.timeout(10_000)
     const saved = await this.read()
     if (saved && saved.workdir !== this.workdir) {
-      throw new Error('Saved session belongs to a different WORKDIR. Send /reset before changing projects.')
+      throw new SessionConfigurationError('Saved session belongs to a different WORKDIR. Send /reset before changing projects.')
     }
     if (saved?.workdir === this.workdir) {
       try {
         const remote = await this.client.session.get({ sessionID: saved.sessionID }, { signal })
         if (!samePath(remote.location.directory, this.workdir)) {
-          throw new Error('Saved OpenCode session location does not match WORKDIR. Send /reset before changing projects.')
+          throw new SessionConfigurationError('Saved OpenCode session location does not match WORKDIR. Send /reset before changing projects.')
         }
         await this.client.session.update({ sessionID: saved.sessionID, permissions: SAFE_PERMISSIONS }, { signal })
         return saved.sessionID
@@ -130,7 +153,16 @@ export class SessionStore {
       location: { directory: this.workdir },
       permissions: SAFE_PERMISSIONS,
     }, { signal })
-    await this.write({ sessionID: session.id, workdir: this.workdir })
+    try {
+      await this.enqueue(() => this.writeAtomically({ sessionID: session.id, workdir: this.workdir }))
+    } catch (error) {
+      try {
+        await this.client.session.remove({ sessionID: session.id }, { signal: AbortSignal.timeout(5_000) })
+      } catch (cleanupError) {
+        console.error(`Failed to remove unpersisted OpenCode session ${session.id}.`, cleanupError)
+      }
+      throw error
+    }
     return session.id
   }
 
@@ -161,10 +193,12 @@ export class SessionStore {
    *
    * @param inboxID - Stable prompt ID used for cancellation.
    */
-  async markActive(inboxID: string): Promise<void> {
-    const saved = await this.read()
-    if (!saved || saved.workdir !== this.workdir) throw new Error('No saved session is available for the active run.')
-    await this.write({ ...saved, activeRun: { inboxID } })
+  markActive(inboxID: string): Promise<void> {
+    return this.enqueue(async () => {
+      const saved = await this.read()
+      if (!saved || saved.workdir !== this.workdir) throw new Error('No saved session is available for the active run.')
+      await this.writeAtomically({ ...saved, activeRun: { inboxID } })
+    })
   }
 
   /**
@@ -172,11 +206,13 @@ export class SessionStore {
    *
    * @param inboxID - Only clear the marker when it belongs to this prompt.
    */
-  async clearActive(inboxID?: string): Promise<void> {
-    const saved = await this.read()
-    if (!saved?.activeRun || (inboxID && saved.activeRun.inboxID !== inboxID)) return
-    const { activeRun: _activeRun, ...withoutActiveRun } = saved
-    await this.write(withoutActiveRun)
+  clearActive(inboxID?: string): Promise<void> {
+    return this.enqueue(async () => {
+      const saved = await this.read()
+      if (!saved?.activeRun || (inboxID && saved.activeRun.inboxID !== inboxID)) return
+      const { activeRun: _activeRun, ...withoutActiveRun } = saved
+      await this.writeAtomically(withoutActiveRun)
+    })
   }
 
   /**
@@ -184,7 +220,12 @@ export class SessionStore {
    *
    * @param sessionID - Session to remove; defaults to the saved session.
    */
-  async reset(sessionID?: string): Promise<void> {
+  reset(sessionID?: string): Promise<void> {
+    return this.enqueue(() => this.resetAtomically(sessionID))
+  }
+
+  /** Removes the server session and local pointer after prior writes finish. */
+  private async resetAtomically(sessionID?: string): Promise<void> {
     const signal = AbortSignal.timeout(10_000)
     const saved = await this.read()
     const target = sessionID ?? saved?.sessionID
@@ -198,34 +239,42 @@ export class SessionStore {
     await rm(this.file, { force: true })
   }
 
+  /** Validates a parsed session JSON value. */
+  private parseSavedSession(value: unknown): SavedSession {
+    if (!isRecord(value)) invalidSessionShape()
+    const { sessionID, workdir } = value
+    if (typeof sessionID !== 'string' || sessionID.length === 0 || typeof workdir !== 'string' || workdir.length === 0) {
+      invalidSessionShape()
+    }
+    const activeRun = parseActiveRun(value)
+    return { sessionID, workdir, ...(activeRun ? { activeRun } : {}) }
+  }
+
   /**
    * Reads and validates the persisted session JSON.
    *
-   * @returns A saved session, or `null` when missing or invalid.
+   * @returns A saved session, or `null` when the file is missing.
+   * @throws When persisted JSON or session shape is invalid.
    */
   private async read(): Promise<SavedSession | null> {
     try {
       /** Parsed but not yet validated JSON value. */
       const saved: unknown = JSON.parse(await readFile(this.file, 'utf8'))
-      if (
-        typeof saved === 'object' && saved !== null &&
-        'sessionID' in saved && typeof saved.sessionID === 'string' &&
-        'workdir' in saved && typeof saved.workdir === 'string'
-      ) {
-        const activeRun = 'activeRun' in saved && isRecord(saved.activeRun) && typeof saved.activeRun.inboxID === 'string'
-          ? { inboxID: saved.activeRun.inboxID }
-          : undefined
-        return { sessionID: saved.sessionID, workdir: saved.workdir, ...(activeRun ? { activeRun } : {}) }
-      }
-      return null
+      return this.parseSavedSession(saved)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       if (error instanceof SyntaxError) {
-        console.warn('Invalid saved session; creating a new one.')
-        return null
+        throw new SessionStateError('Invalid JSON in data/session.json. Back up or remove the file before retrying.')
       }
       throw error
     }
+  }
+
+  /** Serializes a read-modify-write session operation. */
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.writeQueue.then(operation)
+    this.writeQueue = result.then(() => undefined, () => undefined)
+    return result
   }
 
   /**
@@ -233,11 +282,16 @@ export class SessionStore {
    *
    * @param saved - Session data to persist.
    */
-  private async write(saved: SavedSession): Promise<void> {
+  private async writeAtomically(saved: SavedSession): Promise<void> {
     await mkdir(path.dirname(this.file), { recursive: true })
-    /** Process-specific temporary path used before the atomic rename. */
-    const temporary = `${this.file}.${process.pid}.tmp`
-    await writeFile(temporary, JSON.stringify(saved, null, 2), 'utf8')
-    await rename(temporary, this.file)
+    /** Unique temporary path used before the atomic rename. */
+    const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, JSON.stringify(saved, null, 2), 'utf8')
+      await rename(temporary, this.file)
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined)
+      throw error
+    }
   }
 }
