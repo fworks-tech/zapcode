@@ -132,4 +132,3 @@ test('PermissionBridge establishes the stream before reconciling pending request
   permissions.stop()
   assert.deepEqual(order, ['subscribe', 'list'])
 })
-

@@ -85,4 +85,3 @@ test('/yes does not get stuck behind a prompt waiting for permission', async () 
   assert.equal(decided, true)
   await pending
 })
-

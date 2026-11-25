@@ -123,4 +123,3 @@ test('loadKnowledge reads only Markdown deterministically', async () => {
     assert.deepEqual(await loadKnowledge(directory), ['a.md:\nA', 'b.md:\nB'])
   })
 })
-
