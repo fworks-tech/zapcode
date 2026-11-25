@@ -19,4 +19,4 @@ Set `OPENCODE_PASSWORD` in `.env`. `npm run opencode` loads it when starting the
 
 ## Consequences
 
-The bridge works against the real V2 server, and the password stays out of source control. The user must configure the same value in `.env`; the npm script prevents manual duplication. The password must not be shared or committed.
+The bridge targets the generated V2 client contract, and the password stays out of source control. Real-server validation remains a manual check. The user must configure the same value in `.env`; the npm script prevents manual duplication. The password must not be shared or committed.

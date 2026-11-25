@@ -159,16 +159,16 @@ Invoke-RestMethod -Uri "$api/instance/connectionState/$instance" -Method Get -He
 | --- | --- |
 | `/help` | Shows the available commands. |
 | `/reset` | Invalidates current work, cancels the active or recovered inbox item, rejects server-side permissions, removes the OpenCode session, and deletes the local session file. Success is sent only after cleanup is confirmed. |
-| `/yes <id>` | Grants one permission **once**. The ID may be omitted when exactly one request is pending. |
+| `/yes <id>` | Grants one permission **once**, but only after the complete request has been delivered. The ID may be omitted when exactly one request is pending. |
 | `/no <id>` | Rejects every pending request in the same session. The ID may be omitted when exactly one request is pending. |
 
-When OpenCode requests a tool, zapcode sends the complete action and resource through WhatsApp, splitting long requests into ordered chunks. Approval commands share the reset queue so they cannot race session cleanup.
+When OpenCode requests a tool, zapcode sends the complete action and resource through WhatsApp, splitting long requests into ordered chunks with bounded retries. `/yes` is refused until every chunk is delivered. Approval commands share the reset queue so they cannot race session cleanup.
 
 New sessions use conservative rules:
 
 - `glob` is allowed;
 - `read`, `edit`, `shell`, and other tools require approval;
-- `.env*`, external directories, interactive questions, grep, and subagents are denied;
+- reads/edits of `.env*` are denied; external directories, interactive questions, grep, and subagents are also denied;
 - reused sessions are validated and refreshed with the current rules;
 - durable project approvals are removed before prompts and reset so they cannot bypass WhatsApp approval;
 - pending requests denied by the current policy are rejected instead of shown.
@@ -183,13 +183,14 @@ Approved shell commands can still access files and secrets. The permission bridg
 - Reset waits up to 12 seconds for the active run and uses a 5-second cancellation deadline.
 - Failed cancellation keeps the run tracked and blocks new prompts until another `/reset` succeeds.
 - Response chunks have bounded retries. A failed chunk stops the remaining chunks and reports the failure.
-- Webhook IDs are tracked as pending or complete. Failures before OpenCode admission are retryable; failures after admission are deduplicated to avoid repeating tool side effects.
+- Supported text payloads require a non-empty Evolution message ID. IDs are tracked as pending or complete; transient pre-admission failures are retryable, while deterministic setup/state failures and post-admission failures stay deduplicated.
+- Known pre-admission rejections never interrupt an OpenCode session. Cancellation runs only after admission is confirmed or the server response is uncertain.
 
 ## Knowledge base
 
 Edit `knowledge/faq.md` or add other `.md` files. The bridge reads every Markdown file for each question and injects the content as trusted context. Files are loaded alphabetically.
 
-The knowledge base is limited to 20 files and 24,000 total characters. The session and active-run bookkeeping are stored in `data/session.json`.
+The knowledge base is limited to 20 files and 24,000 total characters. A UTF-8 byte-size preflight can reject multibyte content earlier. The session and active-run bookkeeping are stored in `data/session.json`.
 
 ## Development and tests
 
@@ -207,18 +208,19 @@ Automated tests mock external services. Real OpenCode permission matching and th
 - The unofficial API may disconnect, break after WhatsApp updates, or lead to a number ban. Prefer a secondary number for testing.
 - V1 requires the PC, OpenCode, and tunnel to stay active.
 - LLM tokens cost according to the provider; a local model avoids that cost but requires hardware.
-- Deduplication is in memory. Restarting the bridge can allow a very old retry to be processed again.
+- Deduplication is in memory and keeps 500 IDs. Restarting the bridge or evicting an old ID may allow a very old retry to be processed again.
+- Invalid `data/session.json` fails closed. Back up or remove the file before retrying; the bridge will not silently overwrite corrupted state.
 - The quick tunnel has no fixed URL; update the Evolution webhook after restarting it.
 - Evolution's webhook transport timeout is 120 seconds. Queue wait, model execution, and WhatsApp delivery can share that window.
-- V1 has no audio, images, stickers, groups, multi-user support, multi-project support, or distributed queue.
+- V1 has no audio, images, stickers, groups, multi-user support, simultaneous multi-project support, or distributed queue.
 
 ## Phase 2: cloud
 
-Move Evolution and the bridge to a VPS, preserve the volumes, use a fixed URL, and store secrets in the VPS environment. The flow and modules do not need to change; multi-number support and history will require additional persistence.
+Move Evolution and the bridge to a VPS, preserve the volumes, use a fixed URL, and store secrets in the VPS environment. The flow and modules can stay the same. History needs additional persistence; multi-number support also needs per-number session, queue, and permission state.
 
 ## Contributing
 
-Create a branch, follow the local style (TypeScript, single quotes, no semicolons), and use Conventional Commits. Before opening a PR, run `npm test` and `npm run typecheck`. Never commit `.env`, `data/`, or keys.
+Create a branch, follow the local style (TypeScript, single quotes, no semicolons), and use Conventional Commits. Before opening a PR, follow the full pre-push checklist in `AGENTS.md`: tests, typecheck, strict unused check, `npm audit`, and Compose config validation. Never commit `.env*` other than `.env.example`. Also never commit `data/`, logs, credentials, or QR images.
 
 ## References
 

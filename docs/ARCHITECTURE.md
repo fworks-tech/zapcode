@@ -11,19 +11,19 @@
 ## Flow
 
 1. WhatsApp → Evolution → `POST /webhook`. Secret validation runs before JSON parsing.
-2. The bridge validates the JID shape, ignores unsupported events, and blocks unauthorized direct senders.
-3. Message IDs move through pending and completed states. Retryable pre-admission failures release the ID; post-admission failures stay deduplicated.
+2. The bridge validates the JID shape, requires a non-empty message ID for supported text, ignores unsupported events, and blocks unauthorized direct senders.
+3. Message IDs move through pending and completed states. Transient pre-admission failures release the ID; deterministic setup/state failures and post-admission failures stay deduplicated.
 4. `SessionStore.ensure()` validates the saved session and workdir, refreshes its permissions, or creates a new session for `WORKDIR`. A mismatched workdir fails closed until `/reset` removes the old session.
 5. The runtime persists the active inbox ID, loads `knowledge/*.md`, calls `session.prompt`, waits on `experimental.session.wait`, and reads `message.list`.
 6. It extracts only the newest assistant response, splits it into chunks, and sends them in order through Evolution with bounded retries.
-7. `/reset` invalidates the generation, aborts and awaits the run, reconciles and rejects server permissions, removes the OpenCode session, and deletes the local file.
-8. Permission events are scoped to the active session and workdir. Durable project approvals are removed, policy-denied requests are rejected, and complete allowed requests are sent in ordered WhatsApp chunks; `/yes` and `/no` share the reset queue.
+7. `/reset` invalidates the generation, aborts and awaits the run, reconciles and rejects server permissions, deactivates permission events before removing the OpenCode session, and deletes the local file. Failed removal restores permission routing.
+8. Permission events are scoped to the active session and workdir. Durable project approvals are removed, policy-denied requests are rejected with bounded retries, and complete allowed requests are sent in ordered WhatsApp chunks with bounded retries. `/yes` requires every chunk, and `/yes`/`/no` share the reset queue.
 9. Timeout/reset use the stable prompt ID. Cancellation is confirmed through inbox cancellation, interruption, and active/inbox checks when needed.
-10. Shutdown uses the same cancellation path before the HTTP server closes.
+10. Shutdown starts HTTP close and runtime cancellation concurrently; exit waits for both, with a 30-second fallback.
 
 ## Data and configuration
 
-- `data/session.json`: `{ "sessionID": "...", "workdir": "...", "activeRun": { "inboxID": "..." } }`.
+- `data/session.json`: `{ "sessionID": "...", "workdir": "...", "activeRun": { "inboxID": "..." } }`. Writes are serialized and atomic; malformed state fails closed instead of being overwritten.
 - `.env`: `OPENCODE_URL, OPENCODE_PASSWORD, WORKDIR, EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE, ALLOWED_NUMBER, WEBHOOK_SECRET, POSTGRES_PASSWORD, PORT`.
 - `POSTGRES_PASSWORD` is Compose-only; `PORT` is optional and defaults to 3000.
 - Message content is not stored in the Evolution database (`DATABASE_SAVE_DATA_NEW_MESSAGE=false`).

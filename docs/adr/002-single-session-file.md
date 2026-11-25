@@ -9,7 +9,7 @@ The app serves one owner, one phone number, and one `WORKDIR`. We need to preser
 
 ## Decision
 
-Store `{ sessionID, workdir, activeRun? }` in `data/session.json`. The bridge validates reused sessions, refreshes their permissions, and persists the active inbox ID before prompt admission. Reset cancels active or recovered work, rejects server-side permissions, removes the OpenCode session, and only then deletes the file.
+Store `{ sessionID, workdir, activeRun? }` in `data/session.json`. Writes are serialized and atomic. The bridge validates reused sessions, refreshes their permissions, and persists the active inbox ID before prompt admission. Invalid state fails closed instead of being overwritten. Reset cancels active or recovered work, rejects server-side permissions, removes the OpenCode session, and only then deletes the file.
 
 ## Alternatives
 

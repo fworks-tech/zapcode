@@ -16,7 +16,7 @@ Send `/reset`. The bridge cancels active or recovered work, rejects pending perm
 
 ## Which tools need approval?
 
-Read, edit, shell, and other tools require approval. Glob is allowed. `.env*`, external directories, interactive questions, grep, and subagents are denied.
+Read, edit, shell, and other tools require approval. Glob is allowed. Reads/edits of `.env*` are denied. External directories, interactive questions, grep, and subagents are also denied.
 
 ## Can saved OpenCode approvals bypass WhatsApp?
 

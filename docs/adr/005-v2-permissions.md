@@ -10,14 +10,14 @@ Review found that broad read access could expose secrets, reused sessions could 
 ## Decision
 
 - Require approval for broad reads, edits, shell, and other tools; allow glob.
-- Deny `.env*`, external directories, interactive questions, grep, and subagents.
+- Deny reads/edits of `.env*`. Also deny external directories, interactive questions, grep, and subagents.
 - Place specific denies after broad rules because V2 uses the last match.
 - Validate reused sessions and reapply `SAFE_PERMISSIONS` with `session.update`.
 - Remove durable project-scoped saved approvals before prompts and reset so they cannot override WhatsApp approval.
 - Reject pending requests that current policy denies instead of displaying or approving them.
 - Scope live permission events to the active session and require a matching workdir location.
-- Show complete resources in ordered WhatsApp chunks.
-- Reconcile the local permission map with the server before reset and reject every server-side request explicitly.
+- Show complete resources in ordered WhatsApp chunks with bounded retries, and refuse `/yes` until every chunk is delivered.
+- Reconcile the local permission map with the server before reset, reject every known request explicitly, preserve local requests when the server list is unavailable, and await late-event rejections before reset completes.
 - Serialize permission decisions with reset.
 
 ## Alternatives
