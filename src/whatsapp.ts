@@ -16,6 +16,19 @@ interface WhatsAppConfig {
   evolutionInstance: string
 }
 
+/** Chooses a safe chunk boundary without splitting a surrogate pair. */
+function preferredChunkEnd(text: string, start: number, end: number): number {
+  if (end >= text.length) return end
+  const previous = text.charCodeAt(end - 1)
+  const next = text.charCodeAt(end)
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--
+  if (end === start) return Math.min(start + 2, text.length)
+  const newline = text.lastIndexOf('\n', end - 1)
+  if (newline >= start) return newline + 1
+  const space = text.lastIndexOf(' ', end - 1)
+  return space >= start ? space + 1 : end
+}
+
 /**
  * Splits text into ordered chunks without losing content.
  *
@@ -33,23 +46,7 @@ export function chunkText(text: string, limit = 3500): string[] {
   /** Start offset of the chunk currently being built. */
   let start = 0
   while (start < text.length) {
-    /** Candidate end offset for the current chunk. */
-    let end = Math.min(start + limit, text.length)
-    if (end < text.length) {
-      /** UTF-16 code unit immediately before the candidate boundary. */
-      const previous = text.charCodeAt(end - 1)
-      /** UTF-16 code unit immediately after the candidate boundary. */
-      const next = text.charCodeAt(end)
-      if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--
-      if (end === start) end = Math.min(start + 2, text.length)
-
-      /** Preferred newline boundary at or before the candidate end. */
-      const newline = text.lastIndexOf('\n', end - 1)
-      /** Fallback space boundary at or before the candidate end. */
-      const space = text.lastIndexOf(' ', end - 1)
-      if (newline >= start) end = newline + 1
-      else if (space >= start) end = space + 1
-    }
+    const end = preferredChunkEnd(text, start, Math.min(start + limit, text.length))
     chunks.push(text.slice(start, end))
     start = end
   }
