@@ -47,6 +47,35 @@ const required = [
   'WEBHOOK_SECRET',
 ] as const
 
+/** Validates one required secret and rejects example placeholders. */
+function validateSecret(env: NodeJS.ProcessEnv, key: string): void {
+  const value = env[key]!
+  if (value.length < 16 || value.startsWith('replace-')) {
+    throw new Error(`${key} must be at least 16 characters and cannot be the .env.example placeholder.`)
+  }
+}
+
+/** Rejects missing or blank required environment variables. */
+function validateRequired(env: NodeJS.ProcessEnv): void {
+  for (const key of required) {
+    if (!env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`)
+  }
+}
+
+/** Normalizes and validates the owner's WhatsApp number. */
+function parseAllowedNumber(value: string): string {
+  const allowedNumber = value.replace(/\D/g, '')
+  if (allowedNumber.length < 10) throw new Error('ALLOWED_NUMBER must include country code + area code + number.')
+  return allowedNumber
+}
+
+/** Validates the listening port, defaulting to 3000. */
+function parsePort(value: string | undefined): number {
+  const port = Number(value ?? 3000)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT.')
+  return port
+}
+
 /**
  * Loads and validates configuration from an environment object.
  *
@@ -56,26 +85,12 @@ const required = [
  * allowed number is malformed, or the port is outside the TCP range.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  for (const key of required) {
-    if (!env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`)
-  }
-
-  /** Digits-only representation of the owner's WhatsApp number. */
-  const allowedNumber = env.ALLOWED_NUMBER!.replace(/\D/g, '')
-  if (allowedNumber.length < 10) throw new Error('ALLOWED_NUMBER must include country code + area code + number.')
-  if (env.OPENCODE_PASSWORD!.length < 16 || env.OPENCODE_PASSWORD!.startsWith('replace-')) {
-    throw new Error('OPENCODE_PASSWORD must be at least 16 characters and cannot be the .env.example placeholder.')
-  }
-  if (env.WEBHOOK_SECRET!.length < 16 || env.WEBHOOK_SECRET!.startsWith('replace-')) {
-    throw new Error('WEBHOOK_SECRET must be at least 16 characters and cannot be the .env.example placeholder.')
-  }
-  if (env.EVOLUTION_API_KEY!.length < 16 || env.EVOLUTION_API_KEY!.startsWith('replace-')) {
-    throw new Error('EVOLUTION_API_KEY must be at least 16 characters and cannot be the .env.example placeholder.')
-  }
-
-  /** Listening port, defaulting to 3000 when `PORT` is omitted. */
-  const port = Number(env.PORT ?? 3000)
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT.')
+  validateRequired(env)
+  const allowedNumber = parseAllowedNumber(env.ALLOWED_NUMBER!)
+  validateSecret(env, 'OPENCODE_PASSWORD')
+  validateSecret(env, 'WEBHOOK_SECRET')
+  validateSecret(env, 'EVOLUTION_API_KEY')
+  const port = parsePort(env.PORT)
 
   return {
     openCodeUrl: env.OPENCODE_URL!.replace(/\/$/, ''),
