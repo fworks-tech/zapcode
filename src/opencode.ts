@@ -7,7 +7,9 @@
  * timeout and reset paths can cancel the exact inbox item they admitted.
  */
 
-import { OpenCode } from '@opencode/client'
+import { OpenCode, isSessionBusyError, isUnauthorizedError } from '@opencode/client'
+
+import { isNotFound } from './permission-policy.js'
 
 /** Authenticated Promise-based OpenCode V2 client type. */
 export type OpenCodeClient = ReturnType<typeof OpenCode.make>
@@ -25,6 +27,21 @@ export class CancellationNotConfirmedError extends Error {
   /** Creates the unconfirmed-cancellation error. */
   constructor() {
     super('Could not confirm execution cancellation.')
+  }
+}
+
+/** Signals that setup failed before a prompt could be admitted. */
+export class PreAdmissionError extends Error {
+  /**
+   * Creates a pre-admission error.
+   *
+   * @param message - Safe explanation for logs and the owner.
+   * @param retryable - Whether Evolution may retry the same message.
+   * @param options - Optional original error cause.
+   */
+  constructor(message: string, readonly retryable: boolean, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'PreAdmissionError'
   }
 }
 
@@ -54,15 +71,15 @@ type PromptOptions = {
   signal?: AbortSignal
   /** Returns whether this execution still belongs to the active generation. */
   isCurrent?: () => boolean
-  /** Called immediately before `session.prompt` is attempted. */
-  onPromptAttempt?: () => void
 }
 
-/** Returns whether an error represents OpenCode's HTTP 404 response. */
-function isNotFound(error: unknown): boolean {
+/** Returns whether OpenCode explicitly rejected a prompt before admission. */
+function isKnownRejection(error: unknown): boolean {
   const value = error as { name?: unknown; status?: unknown; response?: { status?: unknown } } | null
-  return value?.status === 404 || value?.response?.status === 404 ||
-    (typeof value?.name === 'string' && value.name.endsWith('NotFoundError'))
+  const status = value?.status ?? value?.response?.status
+  return isSessionBusyError(error) || isUnauthorizedError(error) ||
+    status === 400 || status === 401 || status === 404 || status === 409 || status === 422 ||
+    (typeof value?.name === 'string' && /(?:InvalidRequest|BadRequest|Conflict|UnprocessableEntity|NotFound|SessionBusy|Unauthorized)Error$/.test(value.name))
 }
 
 /**
@@ -140,6 +157,105 @@ export async function cancelExecution(client: OpenCodeClient, sessionID: string,
   }
 }
 
+/** Cancels work when prompt admission is confirmed or uncertain. */
+async function cancelUncertainWork(client: OpenCodeClient, sessionID: string, inboxID: string): Promise<void> {
+  try {
+    await cancelExecution(client, sessionID, inboxID)
+  } catch {
+    throw new CancellationNotConfirmedError()
+  }
+}
+
+/** Runtime facts used to classify a failed prompt safely. */
+interface PromptFailureContext {
+  client: OpenCodeClient
+  sessionID: string
+  promptID: string
+  signal: AbortSignal
+  isCurrent: () => boolean
+  promptAttempted: boolean
+  admissionConfirmed: boolean
+}
+
+/** Throws the correct public error after applying cancellation policy. */
+async function throwPromptFailure(error: unknown, context: PromptFailureContext): Promise<never> {
+  if (error instanceof ExecutionCancelledError) throw error
+  if (!context.isCurrent()) throw new ExecutionCancelledError()
+  if (context.signal.aborted) {
+    if (!context.promptAttempted) {
+      throw new PreAdmissionError('Setup timed out before prompt admission.', true, { cause: error })
+    }
+    await cancelUncertainWork(context.client, context.sessionID, context.promptID)
+    throw new Error('55s timeout elapsed. The execution and inbox item were cancelled; try a smaller request.')
+  }
+  if (!context.promptAttempted) {
+    throw new PreAdmissionError('OpenCode setup failed before prompt admission.', true, { cause: error })
+  }
+  if (!context.admissionConfirmed && isKnownRejection(error)) {
+    throw new PreAdmissionError('OpenCode rejected the prompt before admission.', false, { cause: error })
+  }
+  await cancelUncertainWork(context.client, context.sessionID, context.promptID)
+  throw error
+}
+
+/** Builds the trusted knowledge block prepended to a user message. */
+function buildPromptContext(knowledge: string[]): string {
+  return knowledge.length > 0
+    ? `TRUSTED KNOWLEDGE BASE CONTEXT:\n${knowledge.join('\n\n')}\n\nUse it when relevant. Do not invent missing information.`
+    : 'No knowledge base is available; make that clear if relevant.'
+}
+
+/** Admission facts updated while one prompt is submitted. */
+interface AdmissionState {
+  /** Whether `session.prompt` may have reached the server. */
+  promptAttempted: boolean
+  /** Whether OpenCode confirmed prompt admission. */
+  admissionConfirmed: boolean
+}
+
+/** Inputs shared by the successful prompt path. */
+interface PromptExecution {
+  /** Authenticated OpenCode client. */
+  client: OpenCodeClient
+  /** Persistent conversation session. */
+  sessionID: string
+  /** Prompt content and stable inbox ID. */
+  options: PromptOptions
+  /** Combined timeout and reset signal. */
+  signal: AbortSignal
+  /** Returns whether reset invalidated the run. */
+  isCurrent: () => boolean
+  /** Mutable admission facts for failure classification. */
+  admission: AdmissionState
+}
+
+/** Throws when reset invalidated the current execution. */
+function assertCurrent(isCurrent: () => boolean): void {
+  if (!isCurrent()) throw new ExecutionCancelledError()
+}
+
+/** Runs the successful prompt path and records admission uncertainty. */
+async function executePrompt(execution: PromptExecution): Promise<string> {
+  const { client, sessionID, options, signal, isCurrent, admission } = execution
+  assertCurrent(isCurrent)
+  const before = await client.message.list({ sessionID, order: 'desc', type: 'assistant', limit: 1 }, { signal })
+  assertCurrent(isCurrent)
+  const context = buildPromptContext(options.knowledge)
+  admission.promptAttempted = true
+  await client.session.prompt({
+    sessionID,
+    id: options.promptID,
+    text: `${context}\n\nUSER MESSAGE:\n${options.text}`,
+  }, { signal })
+  admission.admissionConfirmed = true
+  assertCurrent(isCurrent)
+  await client.experimental.session.wait({ sessionID }, { signal })
+  assertCurrent(isCurrent)
+  const after = await client.message.list({ sessionID, order: 'desc', type: 'assistant', limit: 20 }, { signal })
+  assertCurrent(isCurrent)
+  return extractReply(after, before.data[0]?.id)
+}
+
 /**
  * Submits a prompt with knowledge context and waits for its final response.
  *
@@ -155,50 +271,21 @@ export async function promptWithContext(
   sessionID: string,
   options: PromptOptions,
 ): Promise<string> {
-  /** Internal 55-second execution deadline. */
   const timeout = AbortSignal.timeout(55_000)
-  /** Combined internal deadline and optional external reset signal. */
   const signal = options.signal ? AbortSignal.any([timeout, options.signal]) : timeout
-  /** Generation check defaulting to current when no reset hook is supplied. */
   const isCurrent = options.isCurrent ?? (() => true)
-  /** Throws before server work when reset already invalidated the run. */
-  const throwIfStale = () => {
-    if (!isCurrent()) throw new ExecutionCancelledError()
-  }
-
+  const admission: AdmissionState = { promptAttempted: false, admissionConfirmed: false }
   try {
-    throwIfStale()
-    /** Assistant message visible before this prompt, used to avoid stale replies. */
-    const before = await client.message.list({ sessionID, order: 'desc', type: 'assistant', limit: 1 }, { signal })
-    throwIfStale()
-    /** Trusted knowledge block prepended to the user's message. */
-    const context = options.knowledge.length > 0
-      ? `TRUSTED KNOWLEDGE BASE CONTEXT:\n${options.knowledge.join('\n\n')}\n\nUse it when relevant. Do not invent missing information.`
-      : 'No knowledge base is available; make that clear if relevant.'
-    options.onPromptAttempt?.()
-    await client.session.prompt({
-      sessionID,
-      id: options.promptID,
-      text: `${context}\n\nUSER MESSAGE:\n${options.text}`,
-    }, { signal })
-    throwIfStale()
-    await client.experimental.session.wait({ sessionID }, { signal })
-    throwIfStale()
-    /** Messages read after execution completes. */
-    const after = await client.message.list({ sessionID, order: 'desc', type: 'assistant', limit: 20 }, { signal })
-    throwIfStale()
-    return extractReply(after, before.data[0]?.id)
+    return await executePrompt({ client, sessionID, options, signal, isCurrent, admission })
   } catch (error) {
-    if (error instanceof ExecutionCancelledError) throw error
-    if (!isCurrent()) throw new ExecutionCancelledError()
-    if (signal.aborted) {
-      try {
-        await cancelExecution(client, sessionID, options.promptID)
-      } catch {
-        throw new CancellationNotConfirmedError()
-      }
-      throw new Error('55s timeout elapsed. The execution and inbox item were cancelled; try a smaller request.')
-    }
-    throw error
+    return await throwPromptFailure(error, {
+      client,
+      sessionID,
+      promptID: options.promptID,
+      signal,
+      isCurrent,
+      promptAttempted: admission.promptAttempted,
+      admissionConfirmed: admission.admissionConfirmed,
+    })
   }
 }
